@@ -1,0 +1,194 @@
+include:
+  - project: "Infrastructure/freedesktop-ci-templates"
+    file: "templates/fedora.yml"
+    ref: "aec7a6ce7bb38902c70641526f6611e27141784a"
+  - project: "Infrastructure/freedesktop-ci-templates"
+    file: "templates/ci-fairy.yml"
+    ref: "aec7a6ce7bb38902c70641526f6611e27141784a"
+  - project: 'gnome/citemplates'
+    file: 'flatpak/flatpak_ci_initiative.yml'
+  - component: 'gitlab.gnome.org/GNOME/citemplates/release-service@master'
+    inputs:
+      dist-job-name: 'flatpak'
+      tarball-artifact-path: "${TARBALL_ARTIFACT_PATH}"
+
+
+variables:
+    FLATPAK_MODULE: "rygel"
+    BUNDLE: "org.gnome.Rygel.Devel.flatpak"
+    TARBALL_ARTIFACT_PATH: ".flatpak-builder/build/${FLATPAK_MODULE}/_flatpak_build/meson-dist/${CI_PROJECT_NAME}-${CI_COMMIT_TAG}.tar.xz"
+    GIT_SUBMODULE_STRATEGY: recursive
+    MESON_TEST_TIMEOUT_MULTIPLIER: 3
+
+flatpak:
+    extends: ['.flatpak']
+    variables:
+        MANIFEST_PATH: "build-aux/org.gnome.Rygel.json"
+        RUNTIME_REPO: "https://flathub.org/repo/flathub.flatpakrepo"
+        # Replace with your application name, as written in the manifest
+        APP_ID: "org.gnome.Rygel"
+
+stages:
+    - review
+    - prepare
+    - build
+    - test
+    - analysis
+    - deploy
+
+.check-template: &check
+  extends:
+    - .fdo.ci-fairy
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - check-junit-report.xml
+    reports:
+      junit: check-junit-report.xml
+
+check-commit-log:
+  variables:
+    GIT_DEPTH: "100"
+  stage: review
+  script:
+    - if [[ x"$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" != "x" ]] ;
+      then
+        ci-fairy check-commits --junit-xml=check-junit-report.xml ;
+      else
+        echo "Not a merge request" ;
+      fi
+  <<: *check
+
+check-merge-request:
+  variables:
+    GIT_STRATEGY: none
+  stage: review
+  script:
+    - if [[ x"$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" != "x" ]] ;
+      then
+        ci-fairy check-merge-request --require-allow-collaboration --junit-xml=check-junit-report.xml ;
+      else
+        echo "Not a merge request" ;
+      fi
+  <<: *check
+
+.build-template: &build
+  stage: build
+  script:
+      - meson . build --prefix=/usr -Db_coverage=true
+      - ninja -C build
+  artifacts:
+      expire_in: 1 day
+      paths:
+          - build
+
+.test-template: &test
+  stage: test
+  variables:
+    G_SLICE: "always-malloc"
+    MALLOC_CHECK_: "3"
+  script:
+    - cd build
+    - |
+      # Remove the many "CI_" variables from the environment. Meson dumps the
+      # whole environment for every failed test, and that gives a whole
+      # screenful of junk each time unless we strip these.
+      unset $(env|grep -o '^CI_[^=]*')
+      env LANG=C.UTF-8 LC_ALL=C.UTF-8 meson test --timeout-multiplier ${MESON_TEST_TIMEOUT_MULTIPLIER} --print-errorlogs ${MESON_TEST_EXTRA_ARGS}
+  after_script:
+    - |
+      echo "Distribution: "
+      echo
+      egrep '^NAME=|^VERSION=' /etc/os-release
+      echo
+      echo "Test suite settings:"
+      echo
+      echo "G_MESSAGES_DEBUG: ${G_MESSAGES_DEBUG}"
+      echo "MESON_TEST_EXTRA_ARGS: ${MESON_TEST_EXTRA_ARGS}"
+      echo
+      echo "These values can be set at https://gitlab.gnome.org/GNOME/{{project}}/pipelines/new"
+  artifacts:
+    expire_in: 1 day
+    when: always
+    paths:
+    - build
+    reports:
+      junit: "build/meson-logs/testlog.junit.xml"
+
+{% for distro in distributions %}
+{% for version in distributions[distro] %}
+.{{project}}.{{distro}}@common:
+  variables:
+      BASE_TAG: '${{"{"}}{{distro|upper}}_BASE_TAG}'
+      FDO_UPSTREAM_REPO: GNOME/{{project}}
+      FDO_DISTRIBUTION_PACKAGES: "{{" ".join(packages[distro].needed)}}"
+      FDO_DISTRIBUTION_EXEC: .gitlab-ci/setup-image-{{distro}}.sh
+
+.{{project}}.{{distro}}:{{version}}@{{arch}}:
+    extends: .{{project}}.{{distro}}@common
+    variables:
+      FDO_DISTRIBUTION_VERSION: "{{version}}"
+      FDO_DISTRIBUTION_TAG: "{{arch}}-${BASE_TAG}"
+
+build-container-{{distro}}:{{version}}@{{arch}}:
+    extends:
+        - .fdo.container-build@{{distro}}
+        - .{{project}}.{{distro}}:{{version}}@{{arch}}
+    stage: prepare
+    variables:
+        GIT_STRATEGY: none
+
+build-{{distro}}:{{version}}@{{arch}}:
+    extends:
+        - .fdo.distribution-image@{{distro}}
+        - .{{project}}.{{distro}}:{{version}}@{{arch}}
+    needs:
+        - build-container-{{distro}}:{{version}}@{{arch}}
+    <<: *build
+
+test-{{distro}}:{{version}}@{{arch}}:
+    tags:
+        - ipv6
+    extends:
+        - .fdo.distribution-image@{{distro}}
+        - .{{project}}.{{distro}}:{{version}}@{{arch}}
+    needs:
+        - build-{{distro}}:{{version}}@{{arch}}
+    <<: *test
+{% endfor %}
+{% endfor %}
+
+{% for downstream in triggers %}
+trigger-{{downstream}}:
+    stage: analysis
+    needs:
+        - test-{{targets["downstream"]}}
+    trigger: {{triggers[downstream]}}
+    only:
+        - master
+{% endfor %}
+
+pages:
+  extends:
+    - .fdo.distribution-image@{{targets["pages"].split(":")[0]}}
+    - .{{project}}.{{targets["pages"]}}
+  stage: deploy
+  script:
+      - meson setup doc-build -Dapi-docs=true -Dplugins=[] -Dexamples=false -Dtests=false
+      - ninja -C doc-build
+      - ninja -C doc-build doc/web/docs
+      - mkdir -p public
+      - .gitlab-ci/collect-reference-docs.sh doc-build
+      - cp -a doc-build/doc/web/docs/* public
+
+  artifacts:
+    paths:
+      - public
+  needs:
+    - build-container-fedora:44@x86_64
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_REF_NAME =~ /^wip\/.*\/ci.*$/
+    - if: $CI_COMMIT_REF_NAME =~ /^wip\/.*\/.*doc.*$/
+    - when: never
+

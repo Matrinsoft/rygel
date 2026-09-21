@@ -1,0 +1,10 @@
+subdir('librygel-core')
+subdir('librygel-db')
+subdir('librygel-renderer')
+subdir('librygel-renderer-gst')
+subdir('librygel-server')
+subdir('media-engines')
+subdir('rygel')
+subdir('ui')
+
+subdir('plugins')
